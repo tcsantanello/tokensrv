@@ -1,0 +1,89 @@
+#!/bin/bash 
+
+resty "http://localhost:8080*" -u user1:password -H "Content-Type: application/json"
+
+echo "======= Invalid ======="
+echo "   Invalid vault"
+GET /vaults/foo/status -v
+echo "   Invalid path"
+GET /something -v
+
+echo "======= Global Status ======="
+GET /status | jq .
+
+cat <<EOF
+**************************************************************************************************
+
+User/password test
+
+**************************************************************************************************
+EOF
+
+resty "http://localhost:8080/vaults/durable*" -u user1:password -H "Content-Type: application/json"
+
+echo "======= Vault Status ======="
+GET /status | jq .
+
+echo "======= POST ======="
+cat <<EOF | POST /token | jq . 
+[ {
+  "userId": "customerId",
+  "value": "6011504345294254",
+  "expiration": "2021-01-01T12:00:00",
+  "properties": [
+    { "name": "key", "value": "value" }
+  ]
+} ]
+EOF
+
+echo "======= PUT ======="
+cat <<EOF | PUT /token/43242342 | jq .
+{
+  "userId": "putTest",
+  "value": "2923092390249024",
+  "expiration": "2021-01-01T12:00:00",
+  "properties": [
+    { "name": "put", "value": "test" }
+  ] 
+}
+EOF
+
+cat <<EOF
+**************************************************************************************************
+
+Token test
+
+**************************************************************************************************
+EOF
+
+resty "http://localhost:8080/vaults/durable*" -H "Authorization: Bearer user1token" -H "Content-Type: application/json"
+
+echo "======= Vault Status ======="
+GET /status | jq .
+
+echo "======= POST ======="
+cat <<EOF | POST /token | jq . 
+[ {
+  "userId": "customerId",
+  "value": "6011504345294254",
+  "expiration": "2021-01-01T12:00:00",
+  "properties": [
+    { "name": "key", "value": "value" }
+  ]
+} ]
+EOF
+
+echo "======= PUT ======="
+cat <<EOF | PUT /token/43242342 | jq .
+{
+  "userId": "putTest",
+  "value": "2923092390249024",
+  "expiration": "2021-01-01T12:00:00",
+  "properties": [
+    { "name": "put", "value": "test" }
+  ] 
+}
+EOF
+
+./dbinit.sh psql <<< "SELECT * from user_limits;"
+
