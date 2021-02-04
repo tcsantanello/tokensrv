@@ -10,6 +10,12 @@
 #include <algorithm>
 #include <boost/process.hpp>
 #include <cctype>
+#include <chrono>
+#include <prometheus/counter.h>
+#include <prometheus/gauge.h>
+#include <prometheus/histogram.h>
+#include <prometheus/registry.h>
+#include <prometheus/text_serializer.h>
 #include <token/api/manager.hh>
 #include <uri/uri.hh>
 
@@ -18,8 +24,57 @@ namespace token {
     namespace beast = boost::beast;
     namespace http  = beast::http;
 
+    using histogram_type = prometheus::Histogram;
+    using gauge_type     = prometheus::Gauge;
+    using counter_type   = prometheus::Counter;
+    using histofam_type  = prometheus::Family< histogram_type >;
+    using gaugefam_type  = prometheus::Family< gauge_type >;
+    using countfam_type  = prometheus::Family< counter_type >;
+
+    template < typename T >
+    struct tracker {};
+
+    template <>
+    struct tracker< gauge_type > {
+      gauge_type &m;
+
+      explicit tracker( gauge_type &_m )
+        : m( _m ) {
+        m.Increment( );
+      }
+      ~tracker( ) { m.Decrement( ); }
+    };
+
+    template <>
+    struct tracker< counter_type > {
+      counter_type &m;
+
+      explicit tracker( counter_type &_m )
+        : m( _m ) {
+        m.Increment( );
+      }
+    };
+
+    template <>
+    struct tracker< histogram_type > {
+      using clock_type = std::chrono::high_resolution_clock;
+      using time_type  = std::chrono::time_point< clock_type >;
+      histogram_type &m;
+      time_type       start;
+
+      explicit tracker( histogram_type &_m )
+        : m( _m )
+        , start( clock_type::now( ) ) {}
+
+      ~tracker( ) {
+        std::chrono::duration< double, std::milli > durms = clock_type::now( ) - start;
+        m.Observe( durms.count( ) );
+      }
+    };
+
     template < typename provider_type >
     class Tokenization {
+      using self_type          = Tokenization< provider_type >;
       using service_type       = token::api::http::HttpService;
       using manager_type       = token::api::TokenManager;
       using database_type      = AuthTokenDB; // token::api::core::TokenDB;
@@ -37,11 +92,24 @@ namespace token {
       std::shared_ptr< executor_type >      executor;
       std::shared_ptr< service_type >       service;
       boost::asio::ssl::context             ctx;
+      histogram_type *                      resp_time;
+      counter_type *                        req_good;
+      counter_type *                        req_limit;
+      counter_type *                        req_bad;
+      gauge_type *                          req_count;
+      prometheus::Registry                  registry;
 
       static bool check( Options &options, token::app::Config &config ) {
         options.parse( );
 
-        if ( options.wantHelp( ) ) {
+        if ( options.has( "version" ) ) {
+          std::cout << PROJECT_NAME ": " PROJECT_VERSION
+#if defined( COMMIT ) // clang-format off
+                                    " (" COMMIT ")"
+#endif // clang-format on
+                                    "\n";
+          exit( 0 );
+        } else if ( options.wantHelp( ) ) {
           options.printHelp( );
           exit( 0 );
         }
@@ -49,7 +117,7 @@ namespace token {
         return true;
       }
 
-      bool processStartCmd( ) {
+      void processStartCmd( ) {
         if ( !options.has( "foreground" ) ) {
           setsid( );
 
@@ -76,11 +144,9 @@ namespace token {
             }
           }
         }
-
-        return false;
       }
 
-      bool processStopCmd( ) {
+      void processStopCmd( ) {
         boost::process::ipstream is;
         boost::process::child    ps( boost::process::search_path( "ps" ),
                                   "-o",
@@ -95,7 +161,7 @@ namespace token {
         arg0.erase( 0, std::find( arg0.rbegin( ), arg0.rend( ), '/' ).base( ) - arg0.begin( ) );
 
         /* Read all lines from ps */
-        while ( ( ps.running( ) ) && ( std::getline( is, line ) ) ) {
+        while ( ( ps.running( ) ) || ( std::getline( is, line ) ) ) {
           line.erase( line.begin( ), std::find_if( line.begin( ), line.end( ), []( char &val ) {
                         return !std::isspace( val );
                       } ) );
@@ -127,68 +193,123 @@ namespace token {
 
           for ( int num = 0; num < 3; ++num ) {
             if ( !kill( line_pid, num < 2 ? SIGTERM : SIGKILL ) ) {
-              return true;
+              return;
             }
           }
         }
-        return true;
       }
 
-      bool processVaultCmd( ) {
+      void processVaultCmd( ) {
         if ( !options.has( "vault-name" ) ) {
           std::cerr << "Must supply a vault name to perform vault operations\n";
-        } else if ( !options.has( "vault-key" ) ) {
+          exit( 1 );
+        }
+
+        if ( !options.has( "vault-key" ) ) {
           std::cerr << "Must supply a vault key to perform vault operations\n";
-        } else {
-          auto vaultName = options.get< std::string >( "vault-name" );
-          auto encKey    = options.get< std::string >( "vault-key" );
+          exit( 1 );
+        }
 
-          if ( options.has( "create" ) ) {
-            if ( !options.has( "vault-hmac" ) ) {
-              std::cerr << "Must supply a vault hash key for vault creation\n";
-            } else if ( !options.has( "vault-format" ) ) {
-              std::cerr << "Must supply a token format id for vault creation\n";
-            } else if ( !options.has( "data-length" ) ) {
-              std::cerr << "Must supply a data length for vault creation\n";
-            } else {
-              auto macKey = options.get< std::string >( "vault-hmac" );
-              auto format = options.get< int >( "vault-format" );
-              auto length = options.get< int >( "data-length" );
+        auto vaultName = options.get< std::string >( "vault-name" );
+        auto encKey    = options.get< std::string >( "vault-key" );
 
-              if ( manager->createVault(
-                     vaultName, encKey, macKey, format, length, !options.has( "single-use" ) ) ) {
-                std::cout << "Successfully created " << vaultName << "\n";
-              } else {
-                std::cerr << "Unable to create vault " << vaultName << "\n";
-              }
-            }
-          } else if ( options.has( "rekey" ) ) {
-            if ( manager->rekeyVault( vaultName, encKey ) ) {
-              std::cout << "Successfully re-keyed " << vaultName << "\n";
-            } else {
-              std::cerr << "Failed to re-key " << vaultName << "\n";
-            }
+        if ( options.has( "create-vault" ) ) {
+          if ( !options.has( "vault-hmac" ) ) {
+            std::cerr << "Must supply a vault hash key for vault creation\n";
+            exit( 1 );
+          }
+
+          if ( !options.has( "vault-format" ) ) {
+            std::cerr << "Must supply a token format id for vault creation\n";
+            exit( 1 );
+          }
+
+          if ( !options.has( "data-length" ) ) {
+            std::cerr << "Must supply a data length for vault creation\n";
+            exit( 1 );
+          }
+
+          auto macKey = options.get< std::string >( "vault-hmac" );
+          auto format = options.get< int >( "vault-format" );
+          auto length = options.get< int >( "data-length" );
+
+          if ( manager->createVault( vaultName, //
+                                     encKey,
+                                     macKey,
+                                     format,
+                                     length,
+                                     !options.has( "single-use" ) ) ) {
+            std::cout << "Successfully created " << vaultName << "\n";
+          } else {
+            std::cerr << "Unable to create vault " << vaultName << "\n";
+            exit( 1 );
+          }
+        } else if ( options.has( "rekey" ) ) {
+          if ( manager->rekeyVault( vaultName, encKey ) ) {
+            std::cout << "Successfully re-keyed " << vaultName << "\n";
+          } else {
+            std::cerr << "Failed to re-key " << vaultName << "\n";
+            exit( 1 );
           }
         }
-        return true;
       }
 
-      bool processStatusCmd( ) { return true; }
-
-      bool processCmd( ) {
-        auto module = options.get< std::string >( "module" );
-
-        if ( module == "start" ) {
-          return processStartCmd( );
-        } else if ( module == "stop" ) {
-          return processStopCmd( );
-        } else if ( module == "vault" ) {
-          return processVaultCmd( );
-        } else if ( module == "status" ) {
-          return processStatusCmd( );
+      void processUserCmd( ) {
+        if ( !options.has( "user" ) ) {
+          std::cerr << "Must supply a user name to perform user operations\n";
+          exit( 1 );
         }
 
-        return false;
+        std::string user = options.get< std::string >( "user" );
+
+        if ( options.has( "create-user" ) ) {
+          if ( !options.has( "password" ) && !options.has( "token" ) ) {
+            std::cerr << "Must supply either a password or API token to create a user\n";
+            exit( 1 );
+          }
+
+          tokenDB->create_user( user, //
+                                options.get< std::string >( "password" ),
+                                options.get< std::string >( "token" ) );
+        }
+
+        if ( options.has( "grant" ) ) {
+          tokenDB->grant_user( user, options.get< std::string >( "vault" ) );
+        }
+
+        if ( options.has( "limit" ) ) {
+          std::string period;
+          int         count = 0;
+          auto        rate  = options.get< std::string >( "rate" );
+          auto        slash = rate.find( "/" );
+
+          if ( slash == std::string::npos ) {
+            std::cerr << "Improperly formatted rate: " << rate << "\n";
+            exit( 1 );
+          }
+
+          count  = std::stoi( rate.substr( 0, slash ) );
+          period = rate.substr( slash + 1 );
+
+          tokenDB->limit_user( user, options.get< std::string >( "vault" ), count, period );
+        }
+      }
+
+      void processCmd( ) {
+        if ( options.has( "start" ) ) {
+          processStartCmd( );
+          return;
+        } else if ( ( options.has( "create-vault" ) ) || ( options.has( "rekey" ) ) ) {
+          processVaultCmd( );
+        } else if ( options.has( "create-user" ) || //
+                    options.has( "grant" ) ||       //
+                    options.has( "limit" ) ) {
+          processUserCmd( );
+        } else if ( options.has( "stop" ) ) {
+          processStopCmd( );
+        }
+
+        exit( 0 );
       }
 
       bool authorized( std::string                  vault,
@@ -260,13 +381,46 @@ namespace token {
         , ctx( boost::asio::ssl::context::sslv23 ) {
 
         check( options, config );
-        tokenDB =
-          std::make_shared< database_type >( config.databaseUrl( ), config.databasePoolSize( ) );
+        tokenDB = std::make_shared< database_type >( config.databaseUrl( ), //
+                                                     config.databasePoolSize( ) );
         manager = std::make_shared< manager_type >( provider, tokenDB );
 
-        if ( processCmd( ) ) {
-          exit( 0 );
-        }
+        processCmd( );
+
+        auto &processing = prometheus::BuildHistogram( )
+                             .Name( "processing" )
+                             .Help( "How long it took to process a request" )
+                             .Register( registry );
+        auto &requests = prometheus::BuildCounter( ) //
+                           .Name( "request" )
+                           .Help( "Number of processed requests" )
+                           .Register( registry );
+        auto &count = prometheus::BuildGauge( )
+                        .Name( "requests" )
+                        .Help( "Number of requests currently being processed" )
+                        .Register( registry );
+
+        resp_time = &processing.Add( { },
+                                     histogram_type::BucketBoundaries{
+                                       0.005,
+                                       0.01,
+                                       0.025,
+                                       0.05,
+                                       0.075,
+                                       0.1,
+                                       0.25,
+                                       0.5,
+                                       0.75,
+                                       1.0,
+                                       2.5,
+                                       5.0,
+                                       7.5,
+                                       10.0,
+                                     } );
+        req_good  = &requests.Add( { { "result", "successful" } } );
+        req_limit = &requests.Add( { { "result", "overdraw" } } );
+        req_bad   = &requests.Add( { { "result", "failure" } } );
+        req_count = &count.Add( { { "state", "processing" } } );
 
         executor = std::make_shared< executor_type >( config.workerPoolSize( ) );
         service  = std::make_shared< service_type >( executor, config.restPoolSize( ) );
@@ -293,10 +447,15 @@ namespace token {
                       [ this ]( service_type::param_map_type &params,
                                 service_type::request_type &  request,
                                 service_type::response_type & response ) -> bool {
-                        uint32_t limit =
-                          preliminary( params[ "vault" ], request, response, nullptr );
+                        tracker< gauge_type >     reqtrack( *req_count );
+                        tracker< histogram_type > dur_track( *resp_time );
+                        uint32_t                  limit = preliminary( params[ "vault" ], //
+                                                      request,
+                                                      response,
+                                                      nullptr );
 
                         if ( !limit ) {
+                          req_limit->Increment( );
                           return true;
                         }
 
@@ -317,10 +476,16 @@ namespace token {
                       [ this ]( service_type::param_map_type &params,
                                 service_type::request_type &  request,
                                 service_type::response_type & response ) -> bool {
-                        auto     body  = nlohmann::json::parse( request.body( ) );
-                        uint32_t limit = preliminary( params[ "vault" ], request, response, &body );
+                        tracker< gauge_type >     reqtrack( *req_count );
+                        tracker< histogram_type > dur_track( *resp_time );
+                        auto                      body  = nlohmann::json::parse( request.body( ) );
+                        uint32_t                  limit = preliminary( params[ "vault" ], //
+                                                      request,
+                                                      response,
+                                                      &body );
 
                         if ( !limit ) {
+                          req_limit->Increment( );
                           return true;
                         }
 
@@ -340,64 +505,76 @@ namespace token {
                         return true;
                       } );
 
-        service->post(
-          "/vaults/{vault}/token",
-          [ this ]( service_type::param_map_type &params,
-                    service_type::request_type &  request,
-                    service_type::response_type & response ) -> bool {
-            nlohmann::json resp_array = nlohmann::json::array( );
-            nlohmann::json req_array;
-            auto           body  = nlohmann::json::parse( request.body( ) );
-            uint32_t       limit = preliminary( params[ "vault" ], request, response, &body );
+        service->post( "/vaults/{vault}/token",
+                       [ this ]( service_type::param_map_type &params,
+                                 service_type::request_type &  request,
+                                 service_type::response_type & response ) -> bool {
+                         tracker< gauge_type >     reqtrack( *req_count );
+                         tracker< histogram_type > dur_track( *resp_time );
+                         nlohmann::json            resp_array = nlohmann::json::array( );
+                         nlohmann::json            req_array;
+                         auto                      body  = nlohmann::json::parse( request.body( ) );
+                         uint32_t                  limit = preliminary( params[ "vault" ], //
+                                                       request,
+                                                       response,
+                                                       &body );
 
-            if ( !limit ) {
-              return true;
-            }
+                         if ( !limit ) {
+                           req_limit->Increment( );
+                           return true;
+                         }
 
-            auto ret = nlohmann::json::object( );
+                         auto ret = nlohmann::json::object( );
 
-            if ( body.is_array( ) ) {
-              req_array = body;
-            } else {
-              req_array = nlohmann::json::array( );
-              req_array.emplace_back( body );
-            }
+                         if ( body.is_array( ) ) {
+                           req_array = body;
+                         } else {
+                           req_array = nlohmann::json::array( );
+                           req_array.emplace_back( body );
+                         }
 
-            for ( auto &rs : req_array.items( ) ) {
-              auto resp_entry = nlohmann::json::object( );
-              auto entry      = token::api::TokenEntry{ };
+                         for ( auto &rs : req_array.items( ) ) {
+                           auto resp_entry = nlohmann::json::object( );
+                           auto entry      = token::api::TokenEntry{ };
 
-              if ( !limit ) {
-                auto status = http::status::forbidden;
+                           if ( !limit ) {
+                             auto status = http::status::forbidden;
 
-                resp_entry[ "code" ]    = std::to_string( static_cast< unsigned >( status ) );
-                resp_entry[ "message" ] = "Messages have been throttled due to overuse";
-              } else {
-                Marshal{ rs.value( ) }
-                  .to( entry )
-                  .from( [ & ]( ) -> token::api::TokenEntry {
-                    return manager->tokenize( params[ "vault" ], entry.value, &entry );
-                  } )
-                  .to( resp_entry );
+                             resp_entry[ "code" ] =
+                               std::to_string( static_cast< unsigned >( status ) );
+                             resp_entry[ "message" ] =
+                               "Messages have been throttled due to overuse";
+                           } else {
+                             Marshal{ rs.value( ) }
+                               .to( entry )
+                               .from( [ & ]( ) -> token::api::TokenEntry {
+                                 return manager->tokenize( params[ "vault" ], entry.value, &entry );
+                               } )
+                               .to( resp_entry );
 
-                --limit;
-              }
+                             --limit;
+                           }
 
-              resp_array.emplace_back( resp_entry );
-            }
+                           resp_array.emplace_back( resp_entry );
+                         }
 
-            response_set( response, body.is_array( ) ? resp_array : resp_array[ 0 ] );
-            return true;
-          } );
+                         response_set( response, body.is_array( ) ? resp_array : resp_array[ 0 ] );
+                         return true;
+                       } );
 
         service->del( "/vaults/{vault}/token/{token}",
                       [ this ]( service_type::param_map_type &params,
                                 service_type::request_type &  request,
                                 service_type::response_type & response ) -> bool {
-                        uint32_t limit =
-                          preliminary( params[ "vault" ], request, response, nullptr );
+                        tracker< gauge_type >     reqtrack( *req_count );
+                        tracker< histogram_type > dur_track( *resp_time );
+                        uint32_t                  limit = preliminary( params[ "vault" ], //
+                                                      request,
+                                                      response,
+                                                      nullptr );
 
                         if ( !limit ) {
+                          req_limit->Increment( );
                           return true;
                         }
 
@@ -418,11 +595,16 @@ namespace token {
                       [ this ]( service_type::param_map_type &params,
                                 service_type::request_type &  request,
                                 service_type::response_type & response ) -> bool {
-                        uint32_t limit =
-                          preliminary( params[ "vault" ], request, response, nullptr );
-                        size_t count = 0;
+                        tracker< gauge_type >     reqtrack( *req_count );
+                        tracker< histogram_type > dur_track( *resp_time );
+                        uint32_t                  limit = preliminary( params[ "vault" ], //
+                                                      request,
+                                                      response,
+                                                      nullptr );
+                        size_t                    count = 0;
 
                         if ( !limit ) {
+                          req_limit->Increment( );
                           return true;
                         }
 
@@ -493,7 +675,9 @@ namespace token {
                       [ this ]( service_type::param_map_type &params,
                                 service_type::request_type &  request,
                                 service_type::response_type & response ) -> bool {
-                        auto resp = nlohmann::json::object( );
+                        tracker< gauge_type >     reqtrack( *req_count );
+                        tracker< histogram_type > dur_track( *resp_time );
+                        auto                      resp = nlohmann::json::object( );
                         Marshal{ manager->status( params[ "vault" ] ) }.to( resp );
                         response_set( response, resp );
                         return true;
@@ -503,9 +687,22 @@ namespace token {
                       [ this ]( service_type::param_map_type &params,
                                 service_type::request_type &  request,
                                 service_type::response_type & response ) -> bool {
-                        auto resp = nlohmann::json::object( );
+                        tracker< gauge_type >     reqtrack( *req_count );
+                        tracker< histogram_type > dur_track( *resp_time );
+                        auto                      resp = nlohmann::json::object( );
                         Marshal{ manager->status( ) }.to( resp );
                         response_set( response, resp );
+                        return true;
+                      } );
+
+        service->get( "/metrics",
+                      [ this ]( service_type::param_map_type &params,
+                                service_type::request_type &  request,
+                                service_type::response_type & response ) -> bool {
+                        auto collected = registry.Collect( );
+
+                        response.set( boost::beast::http::field::content_type, "text/plain" );
+                        response.body( ) = prometheus::TextSerializer( ).Serialize( collected );
                         return true;
                       } );
       }
@@ -513,6 +710,12 @@ namespace token {
       void response_set( service_type::response_type &response, nlohmann::json &json ) {
         response.set( boost::beast::http::field::content_type, "application/json" );
         response.body( ) = json.dump( 2 );
+
+        if ( json.find( "error" ) != json.end( ) ) {
+          req_bad->Increment( );
+        } else {
+          req_good->Increment( );
+        }
       }
 
       int run( ) {

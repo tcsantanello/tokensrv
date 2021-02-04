@@ -1,89 +1,76 @@
 #!/bin/bash
 
-SRC_PATH="$( readlink -f $( dirname $0 ) )"
 SELF=$0
 SDIR=$( cd $( dirname "$SELF" ); pwd )
+VERSION=$( git tag -l --points-at $( git rev-parse HEAD ) | tr '-' '.' )
 
 source dbinit.sh
 
-PROJECT_NAME=$( (
-                  git remote -v; echo ${PWD}.git
-              ) | head -n 1 | sed -ne '1 { s,.*/\([^.]\+\)\.git.*,\1,g; p  }' )
-PROJECT_VERS=$(
-        REV=$( git rev-parse HEAD );
-        TAG=$( git tag -l --points-at $REV | tr '-' '.' );
-        DIRTY=$( git diff --quiet || echo "-dirty" )
-        case "$(git branch)" in
-            *master*) echo ${TAG:-${REV:0:6}}${DIRTY:-${DIRTY}}
-                      ;;
-            *) echo ${REV:0:6}${DIRTY:-${DIRTY}}
-               ;;
-        esac
-  )
-PROJECT_CHAN=$(
+set -eu
+
+function build( ) {
+  local profile=${CONAN_USERNAME:-$USER}-$(
     case "$( git branch )" in
-        *master*) echo "stable"
-                  ;;
-        *) echo "testing"
-           ;;
+      *master*) echo "stable"
+                ;;
+      *) echo "testing"
+         ;;
     esac )
+  local commit=$( git rev-parse HEAD | cut -c 1-6 )$( git diff --quiet || echo "-dirty" )
 
-REFERENCE=${PROJECT_NAME}/${PROJECT_VERS}@${CONAN_USERNAME:-${USER}}/${PROJECT_CHAN}
-PROFILE_NAME=${CONAN_USERNAME:-$USER}-${PROJECT_CHAN}
-
-conan profile new --detect --force ${PROFILE_NAME} || exit $?
-conan profile update settings.compiler.libcxx=libstdc++11 ${PROFILE_NAME} || exit $?
-GCC_VER=$( gcc --version | awk '/^gcc/ { print $NF }' )
-if test "${GCC_VER//.*}" == "10"; then
-    conan profile update settings.compiler.version=${GCC_VER%.*} ${PROFILE_NAME} || exit $?
-fi
-
-CONAN_HOME=${CONAN_USER_HOME:-${HOME}}/.conan
-CONAN_BASE_PATH=$( sed -n '/\[storage\]/,/^path/ { /^path/ { s,path[ \t]*=[ \t]*,,g; p }  }' \
-                       ${CONAN_HOME}/conan.conf )
-
-if test "${CONAN_BASE_PATH:0:1}" == "~"; then 
-    CONAN_BASE_PATH=${CONAN_HOME}${CONAN_BASE_PATH:1}
-fi
-
-conan remove -f ${REFERENCE}
-test -L ./build && /bin/rm ./build
-
-# Export the recipe and source
-conan export ${SDIR} ${REFERENCE} || exit $?
-
-# Compile it and any missing dependencies
-conan create ${SDIR} ${REFERENCE} -s build_type=Debug --build missing -pr ${PROFILE_NAME}
-RC=$?
-
-# Get the build directory (has the built tests)
-# --- THIS DOESN'T WORK!!!!!!!! conan info is bugged here!
-# BUILD=$( conan info ${REFERENCE} --paths --only build_folder --package-filter ${REFERENCE} -pr ${PROFILE_NAME} 
-#             | awk '/build_folder/ { print $2 }' )
-BUILD=${CONAN_BASE_PATH}/${REFERENCE//@/\/}/build/
-BUILD=${BUILD}/$( ls -1 ${BUILD} )
-
-test ! -e ./build && ln -sf ${BUILD} ./build
-test $RC -ne 0 && exit $RC
-
-start
-cp -v restsrv.ini ${BUILD}/bin/
-
-( cd "${BUILD}";
-  export LD_LIBRARY_PATH=${BUILD}:${BUILD}/lib:${BUILD}/bin:${BUILD}/src
-  make test
-  
-  RET=$?
-  
-  if test ${RET} -ne 0; then
-      cat Testing/Temporary/LastTest.log
+  conan profile new --detect --force ${profile} || exit $?
+  conan profile update settings.compiler.libcxx=libstdc++11 ${profile} || exit $?
+  GCC_VER=$( gcc --version | awk '/^gcc/ { print $NF }' )
+  if test "${GCC_VER//.*}" == "10"; then
+    conan profile update settings.compiler.version=${GCC_VER%.*} ${profile} || exit $?
   fi
+
+  test ! -d build && mkdir build
+
+  (
+    cd build
+
+    conan install .. --build=missing -pr ${profile} -s build_type=${1:-Release}
+    cmake .. -DVERSION=${VERSION} -DCOMMIT=${commit} -DCMAKE_BUILD_TYPE=${1:-Release}
+    VERBOSE=1 cmake --build   .
+    cmake --install .
+  )
+
+  start
   
-  exit $RET
-); RET=$?
+  cp -v restsrv.ini build/bin/
 
-exit $RET
+  ( cd "${SDIR}/build";
+    export LD_LIBRARY_PATH=${PWD}:${PWD}/lib:${PWD}/bin:${PWD}/src
+    make test
+    
+    RET=$?
+    
+    if test ${RET} -ne 0; then
+      cat Testing/Temporary/LastTest.log
+    fi
+    
+    exit $RET
+  ); RET=$?
+  
+  return $RET
+}
 
+function container( ) {
+  docker build .                                                           \
+    -t ${1:-restsrv:latest}                                                \
+    ${CONAN_LOCAL_REPO:+--build-arg CONAN_LOCAL_REPO=${CONAN_LOCAL_REPO}}  \
+    ${CONAN_REPO_USER:+--build-arg CONAN_REPO_USER=${CONAN_REPO_USER}}     \
+    ${CONAN_REPO_PASS:+--build-arg CONAN_REPO_PASS=${CONAN_REPO_PASS}}     \
+    --build-arg VERSION=${VERSION} "${@:2}"
+}
 
-cat inst/conanbuildinfo.json | jq -r '.dependencies[].lib_paths[]' | while read line; do ( cd "${line}"; tar cf - *.so* ) | ( cd f/lib; tar xf - ); done
-chrpath -r \$ORIGIN:\$ORIGIN/../lib f/bin/* f/lib/*
+case "${1:-local}" in
+  local)
+    build "${@:2}"
+    ;;
+  container)
+    $1 "${@:2}"
+    ;;
+esac
+

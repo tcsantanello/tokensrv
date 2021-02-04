@@ -1,6 +1,8 @@
 #ifndef __CONFIG_H_
 #define __CONFIG_H_
 
+#include <boost/filesystem/convenience.hpp>
+#include <boost/filesystem/operations.hpp>
 #include <boost/property_tree/ini_parser.hpp>
 #include <boost/property_tree/ptree.hpp>
 #include <spdlog/spdlog.h>
@@ -31,9 +33,25 @@ namespace token {
        * @brief 'Main' constructor; loads the configuration file based on the application name
        */
       Config( int argc, const char *argv[] ) {
-        std::string ini = std::string{ argv[ 0 ] } + std::string{ ".ini" };
-        boost::property_tree::read_ini( ini, config );
-        spdlog::set_level( getLogLevel( ) );
+        boost::filesystem::path path = boost::filesystem::canonical( argv[ 0 ] );
+        boost::filesystem::path file = path.stem( );
+
+        file += std::string{ ".ini" };
+
+        boost::filesystem::path search[] = {
+          path.parent_path( ) / file,                        // Same directory
+          path.parent_path( ).parent_path( ) / "etc" / file, // Sibling directory
+          path.parent_path( ).parent_path( ) / file,         // Parent path
+          boost::filesystem::current_path( ) / file,         // Current working directory
+        };
+
+        for ( auto &entry : search ) {
+          if ( boost::filesystem::exists( entry ) ) {
+            boost::property_tree::read_ini( entry.string( ), config );
+            spdlog::set_level( getLogLevel( ) );
+            break;
+          }
+        }
       }
 
       /**
@@ -46,7 +64,9 @@ namespace token {
        * @brief Get the database connection pool size
        * @return configured database pool size, or 1 if unconfigured
        */
-      int databasePoolSize( ) const { return config.get( "database.pool_size", DATABASE_POOL_SIZE_DEFAULT ); }
+      int databasePoolSize( ) const {
+        return config.get( "database.pool_size", DATABASE_POOL_SIZE_DEFAULT );
+      }
 
       /**
        * @brief Get the HTTP/REST listener address
@@ -66,13 +86,17 @@ namespace token {
        * @brief Get the HTTP/REST IO pool size
        * @return configured pool size, or 1 if unconfigured
        */
-      int restPoolSize( ) const { return config.get( "http.rest.pool_size", HTTP_POOL_SIZE_DEFAULT ); }
+      int restPoolSize( ) const {
+        return config.get( "http.rest.pool_size", HTTP_POOL_SIZE_DEFAULT );
+      }
 
       /**
        * @brief Get the number of worker threads
        * @return configured pool size or CPU core count if unconfigured
        */
-      int workerPoolSize( ) const { return config.get( "worker.pool_size", WORKER_POOL_SIZE_DEFAULT ); }
+      int workerPoolSize( ) const {
+        return config.get( "worker.pool_size", WORKER_POOL_SIZE_DEFAULT );
+      }
 
       /**
        * @brief Get the configured log level

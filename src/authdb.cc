@@ -3,8 +3,159 @@
 #include <openssl/bio.h>
 #include <openssl/evp.h>
 
+#include "ratelimit-1.h"
+#include "ratelimit-2.h"
+
 namespace token {
   namespace app {
+    void AuthTokenDB::init( ) {
+      auto connection = dbPool.getConnection( );
+      bool commit     = false;
+
+      if ( !( connection << "SELECT 1 FROM pg_tables WHERE tablename = ?"
+                         << "vaults" )
+              .executeQuery( )
+              .next( ) ) {
+        ( connection << ( "CREATE TABLE vaults ( "
+                          "  id         SERIAL PRIMARY KEY, "
+                          "  format     INTEGER, "
+                          "  alias      VARCHAR(255), "
+                          "  tablename  VARCHAR(255), "
+                          "  enckey     VARCHAR(255), "
+                          "  mackey     VARCHAR(255), "
+                          "  durable    BOOLEAN, "
+                          "  CONSTRAINT vaults_alias_key UNIQUE ( alias ), "
+                          "  CONSTRAINT vaults_name_key UNIQUE ( tablename ) "
+                          ")" ) )
+          .execute( );
+        commit = true;
+      }
+
+      if ( !( connection << "SELECT 1 FROM pg_tables WHERE tablename = ?"
+                         << "users" )
+              .executeQuery( )
+              .next( ) ) {
+        ( connection
+          << ( "CREATE TABLE users ( "
+               "  id         SERIAL PRIMARY KEY,"
+               "  username   VARCHAR(50) NOT NULL,"
+               "  password   CHAR(64),"
+               "  token      VARCHAR(25),"
+               "  CONSTRAINT users_username_key UNIQUE( username ),"
+               "  CONSTRAINT users_token_key    UNIQUE( token ),"
+               "  CONSTRAINT users_auth_key CHECK ( password is not null or token is not null )"
+               ")" ) )
+          .execute( );
+        commit = true;
+      }
+
+      if ( !( connection << "SELECT 1 FROM pg_tables WHERE tablename = ?"
+                         << "user_vaults" )
+              .executeQuery( )
+              .next( ) ) {
+        ( connection << ( "CREATE TABLE user_vaults ( "
+                          "  id         SERIAL PRIMARY KEY,"
+                          "  userid     INTEGER NOT NULL,"
+                          "  vault      INTEGER NOT NULL,"
+                          "  CONSTRAINT user_vaults_vault_fk  FOREIGN KEY ( vault ) REFERENCES "
+                          "             vaults( id ) ON DELETE CASCADE,"
+                          "  CONSTRAINT user_vaults_userid_fk FOREIGN KEY ( userid ) REFERENCES "
+                          "             users( id ) ON DELETE CASCADE,"
+                          "  CONSTRAINT user_vaults_uid_vault UNIQUE ( userid, vault )"
+                          ")" ) )
+          .execute( );
+        commit = true;
+      }
+
+      if ( !( connection << "SELECT 1 FROM pg_tables WHERE tablename = ?"
+                         << "user_limits_config" )
+              .executeQuery( )
+              .next( ) ) {
+        ( connection << ( "CREATE TABLE user_limits_config ("
+                          "  id         SERIAL PRIMARY KEY,"
+                          "  uvault_id  INTEGER NOT NULL,"
+                          "  period     INTERVAL NOT NULL,"
+                          "  value      INTEGER NOT NULL,"
+                          "  CONSTRAINT user_limit_vaults_fk FOREIGN KEY ( uvault_id ) REFERENCES "
+                          "             user_vaults( id ) ON DELETE CASCADE"
+                          ")" ) )
+          .execute( );
+        commit = true;
+      }
+
+      if ( !( connection << "SELECT 1 FROM pg_tables WHERE tablename = ?"
+                         << "user_limits" )
+              .executeQuery( )
+              .next( ) ) {
+        ( connection << ( "CREATE TABLE user_limits ("
+                          "  id         SERIAL PRIMARY KEY,"
+                          "  config_id  INTEGER NOT NULL,"
+                          "  expire     TIMESTAMP NOT NULL,"
+                          "  value      INTEGER NOT NULL,"
+                          "  CONSTRAINT user_limits_config_fk FOREIGN KEY ( config_id ) REFERENCES "
+                          "             user_limits_config( id ) ON DELETE CASCADE"
+                          ")" ) )
+          .execute( );
+        commit = true;
+      }
+
+      if ( !( connection << "SELECT 1 FROM pg_proc WHERE proname = ?"
+                         << "user_limit" )
+              .executeQuery( )
+              .next( ) ) {
+        ( connection << ( std::string{ ( char * ) ratelimit_1_sql } ) ).execute( );
+        ( connection << ( std::string{ ( char * ) ratelimit_2_sql } ) ).execute( );
+        commit = true;
+      }
+
+      if ( commit ) {
+        connection.commit( );
+      }
+    }
+
+    bool AuthTokenDB::create_user( std::string user, std::string pass, std::string token ) {
+      auto connection = dbPool.getConnection( );
+      auto statement  = connection << "INSERT INTO users ( username, password, token )"
+                                     " VALUES ( ?, encode( digest( ?, 'sha256' ), 'hex' ), ? )"
+                                  << user << pass << token;
+      auto rc = statement.executeUpdate( ) > 0;
+      connection.commit( );
+      return rc;
+    }
+
+    bool AuthTokenDB::grant_user( std::string user, std::string vault ) {
+      auto connection = dbPool.getConnection( );
+      auto statement  = connection << "INSERT INTO user_vaults( userid, vault )"
+                                     " SELECT u.id, v.id"
+                                     "   FROM users u, vaults v"
+                                     "  WHERE u.username = ? "
+                                     "    AND ? in ( v.alias, v.tablename )"
+                                  << user << vault;
+      auto rc = statement.executeUpdate( ) > 0;
+      connection.commit( );
+      return rc;
+    }
+
+    bool AuthTokenDB::limit_user( std::string user,
+                                  std::string vault,
+                                  int         count,
+                                  std::string period ) {
+      auto connection = dbPool.getConnection( );
+      auto statement  = connection << "INSERT INTO user_limits_config( uvault_id, period, value )"
+                                     " SELECT uv.id, ?::interval, ?"
+                                     "   FROM user_vaults uv, "
+                                     "        users u, "
+                                     "        vaults v "
+                                     "  WHERE u.username = ? "
+                                     "    AND uv.userid = u.id"
+                                     "    AND uv.vault = v.id"
+                                     "    AND ? in ( v.alias, v.tablename )"
+                                  << period << count << user << vault;
+      auto rc = statement.executeUpdate( ) > 0;
+      connection.commit( );
+      return rc;
+    }
+
     uint32_t AuthTokenDB::authorizedCreds( std::string user, std::string pass ) {
       auto connection = dbPool.getConnection( );
       auto statement  = connection << "SELECT id FROM users WHERE username = ? AND password = "
@@ -87,11 +238,7 @@ namespace token {
             << vault.table << vault.alias )
             .executeQuery( );
 
-        if ( !rs.next( ) ) {
-          return false;
-        }
-
-        if ( rs.get< int32_t >( 0 ) ) {
+        if ( rs.next( ) ) {
           std::cerr << "Unable to create vault; name or table already exists\n";
           return false;
         }

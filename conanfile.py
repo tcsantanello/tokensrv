@@ -39,10 +39,10 @@ def uniq(*args):
     return entries
 
 class TokenRestAPIConan(ConanFile):
-    name = "token-rest"
+    name = "tokensrv"
     license = "BSD-2-Clause"
     author = "Thomas Santanello <tcsantanello@gmail.com>"
-    url = "https://gitea.apps.nemesus.homeip.net/c-cpp-projects/token-rest.git"
+    url = "https://github.com/tcsantanello/tokensrv"
     description = "Tokenization Rest API for C++"
     topics = ("token", "PCI")
     build_policy = "missing"
@@ -53,6 +53,9 @@ class TokenRestAPIConan(ConanFile):
     }
     default_options = {
         "shared": True,
+        "prometheus-cpp:with_pull": False,
+        "prometheus-cpp:with_push": False,
+        "prometheus-cpp:with_compression": False,
     }
 
     def requirements(self):
@@ -62,6 +65,7 @@ class TokenRestAPIConan(ConanFile):
         self.requires.add("spdlog/1.3.0@bincrafters/stable")
         self.requires.add("cppuri/1.0.0@tcsantanello/stable")
         self.requires.add("tokengov/1.0.0@tcsantanello/stable")
+        self.requires.add("prometheus-cpp/0.11.0")
 
     def export_sources(self):
         git = tools.Git(".")

@@ -1,4 +1,4 @@
-DROP FUNCTION user_limit;
+
 CREATE OR REPLACE FUNCTION user_limit( _userid integer, _vault varchar, _requests integer ) RETURNS int AS $$
 DECLARE
   config  user_limits_config%ROWTYPE;
@@ -12,8 +12,9 @@ BEGIN
     INTO config
     FROM user_limits_config ulc
    INNER JOIN user_vaults uv ON uv.id = ulc.uvault_id
+   INNER JOIN vaults      v  ON v.id  = uv.id
    WHERE uv.userid = _userid
-     AND uv.vault  = _vault;
+     AND _vault IN ( v.alias, v.tablename );
 
   IF FOUND THEN -- If there is a config, start adjusting limits
     --
@@ -65,12 +66,4 @@ BEGIN
   END IF;
 
   RETURN allowed;
-END $$ LANGUAGE plpgsql;
-
-CREATE OR REPLACE FUNCTION user_limit( _username varchar, vault varchar, requests integer ) RETURNS int AS $$
-DECLARE
-  userid integer;
-BEGIN
-  SELECT id INTO userid FROM user_vaults WHERE username = _username;
-  RETURN user_limit( userid, vault, requests );
 END $$ LANGUAGE plpgsql;
